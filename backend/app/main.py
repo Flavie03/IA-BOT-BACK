@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from app.agent.router import router as agent_router
 from app.mcp.server import router as mcp_router
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI()
 
