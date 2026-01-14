@@ -59,6 +59,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     return json.loads(m.group(0))
 
 
+# --- Ancienne classification (optionnelle) ---
 def classify_intent(message: str) -> str:
     system = (
         "Tu es un classificateur d'intention utilisateur.\n"
@@ -68,6 +69,47 @@ def classify_intent(message: str) -> str:
     )
     out = _ollama_chat(system, f"Message utilisateur: {message}").lower().strip()
     return "travel" if "travel" in out else "social"
+
+
+# --- Nouvelle classification recommandée (4 catégories) ---
+def classify_intent_llm_4cats(message: str) -> str:
+    """
+    Classifie le message dans UNE SEULE catégorie parmi:
+    - small_talk : salutations, remerciements, small talk, discussion légère
+    - intent_metier : questions liées à la planification de voyage/transport
+    - hors_perimetre : questions sans rapport (math, dev, politique, etc.)
+    - ambigu : pas assez d'info / message trop vague
+    Retourne uniquement l'un de ces 4 mots.
+    """
+    system = (
+        "Tu es un classificateur d'intention.\n"
+        "Tu dois répondre STRICTEMENT par UNE SEULE catégorie parmi:\n"
+        "- small_talk\n"
+        "- intent_metier\n"
+        "- hors_perimetre\n"
+        "- ambigu\n\n"
+        "Définitions:\n"
+        "small_talk: salutations, remerciements, politesse, conversation légère.\n"
+        "intent_metier: planification voyage (destination, période, météo, vols, hôtels, budget, itinéraire).\n"
+        "hors_perimetre: tout le reste (math, code, questions générales hors voyage).\n"
+        "ambigu: trop court ou manque d'infos pour décider.\n\n"
+        "Règles:\n"
+        "- Réponds uniquement par le mot exact de la catégorie (sans ponctuation).\n"
+        "- Ne justifie pas.\n"
+    )
+
+    out = _ollama_chat(system, f"Message: {message}").strip().lower()
+
+    allowed = {"small_talk", "intent_metier", "hors_perimetre", "ambigu"}
+    if out in allowed:
+        return out
+
+    # fallback robuste si le modèle renvoie une phrase
+    for cat in allowed:
+        if cat in out:
+            return cat
+
+    return "ambigu"
 
 
 def decide_tools(
