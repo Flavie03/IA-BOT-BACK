@@ -4,21 +4,63 @@ import requests
 from app.agent.schemas import AgentQuery, AgentResponse
 from app.agent.kb import get_destination_info
 from app.agent.parser import extract_destination, normalize_city_for_tool
-from app.agent.llm import decide_tools, generate_answer
+from app.agent.llm import decide_tools, generate_answer, classify_intent_llm_4cats
+from app.agent.intent import classify_intent_rules
 
 router = APIRouter()
+
 
 @router.post("/query", response_model=AgentResponse)
 def query_agent(payload: AgentQuery):
     user_message = payload.message
 
+    # 0) Classification d'intention AVANT tout (small talk / hors périmètre)
+    intent = classify_intent_rules(user_message)
+
+    # fallback LLM uniquement si ambigu (recommandé par le doc d'Aurélien)
+    if intent == "ambigu":
+        intent = classify_intent_llm_4cats(user_message)
+
+    # Small talk -> réponse courte + recadrage
+    if intent == "small_talk":
+        return AgentResponse(
+            answer=(
+                "Salut 🙂 Je peux t’aider à planifier un voyage : "
+                "destination, meilleure période, météo actuelle, vols et hôtels. "
+                "Tu veux partir où ?"
+            ),
+            decision={
+                "intent": intent,
+                "kb_used": False,
+                "tools_called": [],
+                "llm_decision": {"use_tools": False, "tools": [], "reason": "small_talk"}
+            }
+        )
+
+    # Hors périmètre -> refus poli + recadrage
+    if intent == "hors_perimetre":
+        return AgentResponse(
+            answer=(
+                "Je suis spécialisé dans la planification de voyage (météo, vols, hôtels, période idéale). "
+                "Ta demande n’est pas dans ce périmètre. "
+                "Pose-moi plutôt une question liée à un déplacement 🙂"
+            ),
+            decision={
+                "intent": intent,
+                "kb_used": False,
+                "tools_called": [],
+                "llm_decision": {"use_tools": False, "tools": [], "reason": "hors_perimetre"}
+            }
+        )
+
+    # 1) Intent métier -> flow agentique normal (KB -> décision -> tools -> réponse)
     destination = extract_destination(user_message)           # ex: "lisbonne"
     kb_info = get_destination_info(destination)               # dict ou None
 
     tools_called = []
     tool_results = {}
 
-    # 1) Décision tool/no-tool via LLM
+    # 2) Décision tool/no-tool via LLM (agentique)
     llm_decision = decide_tools(
         user_message=user_message,
         destination=destination,
@@ -26,7 +68,7 @@ def query_agent(payload: AgentQuery):
         available_tools=["weather", "flights", "hotels"]
     )
 
-    # 2) Exécuter les tools décidés
+    # 3) Exécuter les tools décidés
     if llm_decision.get("use_tools") and destination:
         for tool in llm_decision.get("tools", []):
             name = tool.get("name")
@@ -72,7 +114,7 @@ def query_agent(payload: AgentQuery):
             except Exception as e:
                 tool_results[f"{name}_error"] = str(e)
 
-    # 3) Réponse finale via LLM
+    # 4) Réponse finale via LLM
     final_answer = generate_answer(
         user_message=user_message,
         destination=destination,
@@ -80,10 +122,11 @@ def query_agent(payload: AgentQuery):
         tool_results=tool_results if tool_results else None
     )
 
-    # 4) Retour (traçable pour la soutenance)
+    # 5) Retour (traçable pour la soutenance)
     return AgentResponse(
         answer=final_answer,
         decision={
+            "intent": intent,
             "destination": destination,
             "kb_used": bool(kb_info),
             "tools_called": tools_called,
