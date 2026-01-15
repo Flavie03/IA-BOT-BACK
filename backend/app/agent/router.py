@@ -12,7 +12,8 @@ from app.agent.airports import get_airport_code
 
 router = APIRouter()
 
-# Un petit parsing pour les mois yc
+# ----------------------------
+#parsing (simple & fiable)
 MONTHS_FR_TO_NUM = {
     "janvier": "01",
     "février": "02", "fevrier": "02",
@@ -29,52 +30,32 @@ MONTHS_FR_TO_NUM = {
 }
 
 def extract_route_cities(message: str):
-    """
-    Extrait (origin_city, destination_city) depuis une phrase type:
-    - "de Paris à Bangkok"
-    - "de Paris a Bangkok"
-    - "depuis Paris vers Bangkok"
-    - "Paris -> Bangkok"
-    Retourne (None, None) si non trouvé.
-    """
     m = message.lower().strip()
-
     patterns = [
         r"\bde\s+([a-zA-Zéèêàçîôû\-]+)\s+(?:a|à)\s+([a-zA-Zéèêàçîôû\-]+)\b",
         r"\bdepuis\s+([a-zA-Zéèêàçîôû\-]+)\s+(?:vers|pour)\s+([a-zA-Zéèêàçîôû\-]+)\b",
         r"\b([a-zA-Zéèêàçîôû\-]+)\s*(?:->|→)\s*([a-zA-Zéèêàçîôû\-]+)\b",
     ]
-
     for p in patterns:
         match = re.search(p, m)
         if match:
             return match.group(1), match.group(2)
-
     return None, None
 
 
 def extract_month_or_dates(message: str):
-    """
-    Retourne:
-    - 'YYYY-MM' si on détecte un mois (fr) ou un format YYYY-MM
-    - 'YYYY-MM-DD/YYYY-MM-DD' si on détecte un range de dates
-    - None sinon
-    """
     m = message.lower().strip()
 
-    # dates explicites: 2026-01-30/2026-02-20
     match = re.search(r"\b\d{4}-\d{2}-\d{2}/\d{4}-\d{2}-\d{2}\b", m)
     if match:
         return match.group(0)
 
-    # mois en français
     for fr_month, mm in MONTHS_FR_TO_NUM.items():
         if fr_month in m:
             year_match = re.search(r"\b(20\d{2})\b", m)
             yyyy = year_match.group(1) if year_match else str(date.today().year)
             return f"{yyyy}-{mm}"
 
-    # format YYYY-MM
     match = re.search(r"\b(20\d{2}-\d{2})\b", m)
     if match:
         return match.group(1)
@@ -89,6 +70,20 @@ def need_clarification_for_flights(origin_iata, dest_iata, month):
         return "Pour chercher des vols, tu vas vers quelle ville/aéroport ?"
     if not month:
         return "Pour quelles dates ou quel mois veux-tu voyager ? (ex: 2026-01 ou 2026-01-30/2026-02-20)"
+    return None
+
+
+def need_clarification_for_hotels(dest_city, month):
+    if not dest_city:
+        return "Pour chercher des hôtels, dans quelle ville veux-tu dormir ?"
+    if not month:
+        return "Pour quelles dates ou quel mois veux-tu réserver ? (ex: 2026-01 ou 2026-01-16/2026-01-17)"
+    return None
+
+
+def need_clarification_for_weather(dest_city):
+    if not dest_city:
+        return "Pour la météo, tu veux la météo de quelle ville ?"
     return None
 
 
@@ -137,9 +132,7 @@ def query_agent(payload: AgentQuery):
     # 1) Parsing route (origin/destination) & destination métier
     # =========================================================
     origin_city, dest_city = extract_route_cities(user_message)
-
-    # Destination utilisée pour KB : on prend dest_city si trouvée
-    destination = dest_city or extract_destination(user_message)
+    destination = dest_city or extract_destination(user_message)  # ex: "bangkok"
     kb_info = get_destination_info(destination)
 
     tools_called = []
@@ -156,19 +149,49 @@ def query_agent(payload: AgentQuery):
     )
 
     # =========================================================
-    # 2bis) PATCH: override rule-based si le user parle de vols/prix/billets
-    # (sinon le LLM peut choisir use_tools=false et halluciner des prix)
+    # 2bis) OVERRIDES RULE-BASED (weather + flights + hotels)
     # =========================================================
     msg = user_message.lower()
-    force_flights = any(k in msg for k in ["vol", "vols", "billet", "billets", "avion", "aéroport", "aeroport", "prix"])
 
+    force_weather = any(k in msg for k in ["météo", "meteo", "temps", "aujourd", "actuel", "actuelle", "maintenant", "prévision", "prevision"])
+    force_flights = any(k in msg for k in ["vol", "vols", "billet", "billets", "avion", "aéroport", "aeroport", "prix"])
+    force_hotels = any(k in msg for k in ["hotel", "hôtel", "logement", "hébergement", "hebergement", "nuit", "nuits", "booking"])
+
+    def _has_tool(decision: dict, tool_name: str) -> bool:
+        return any(t.get("name") == tool_name for t in decision.get("tools", []))
+
+    # WEATHER override
+    if force_weather and destination:
+        if not llm_decision.get("use_tools"):
+            llm_decision["use_tools"] = True
+            llm_decision["tools"] = [{"name": "weather", "params": {}}]
+            llm_decision["reason"] = "Rule-based override: user asked for current weather"
+        else:
+            if not _has_tool(llm_decision, "weather"):
+                llm_decision["tools"].append({"name": "weather", "params": {}})
+                llm_decision["reason"] = (llm_decision.get("reason", "") + " + weather override").strip()
+
+    # FLIGHTS override
     if force_flights and destination:
-        # si le LLM n'a pas demandé flights, on force
-        has_flights = any(t.get("name") == "flights" for t in llm_decision.get("tools", []))
-        if not llm_decision.get("use_tools") or not has_flights:
+        if not llm_decision.get("use_tools"):
             llm_decision["use_tools"] = True
             llm_decision["tools"] = [{"name": "flights", "params": {}}]
             llm_decision["reason"] = "Rule-based override: user asked for flights/prices"
+        else:
+            if not _has_tool(llm_decision, "flights"):
+                llm_decision["tools"].append({"name": "flights", "params": {}})
+                llm_decision["reason"] = (llm_decision.get("reason", "") + " + flights override").strip()
+
+    # HOTELS override
+    if force_hotels and destination:
+        if not llm_decision.get("use_tools"):
+            llm_decision["use_tools"] = True
+            llm_decision["tools"] = [{"name": "hotels", "params": {}}]
+            llm_decision["reason"] = "Rule-based override: user asked for hotels/accommodation"
+        else:
+            if not _has_tool(llm_decision, "hotels"):
+                llm_decision["tools"].append({"name": "hotels", "params": {}})
+                llm_decision["reason"] = (llm_decision.get("reason", "") + " + hotels override").strip()
 
     # =========================================================
     # 3) Exécuter les tools décidés
@@ -178,11 +201,27 @@ def query_agent(payload: AgentQuery):
             name = tool.get("name")
             params = tool.get("params") or {}
 
-            # normalisation "city" pour weather/hotels
             city_for_tool = normalize_city_for_tool(destination)
 
             try:
                 if name == "weather":
+                    clarification = need_clarification_for_weather(destination)
+                    if clarification:
+                        return AgentResponse(
+                            answer=clarification,
+                            decision={
+                                "intent": intent,
+                                "destination": destination,
+                                "kb_used": bool(kb_info),
+                                "tools_called": tools_called,
+                                "llm_decision": {
+                                    "use_tools": False,
+                                    "tools": [],
+                                    "reason": f"Missing parameters for weather: {clarification}"
+                                }
+                            }
+                        )
+
                     resp = requests.post(
                         "http://127.0.0.1:8000/mcp/weather",
                         json={"city": city_for_tool},
@@ -194,25 +233,40 @@ def query_agent(payload: AgentQuery):
 
                 elif name == "hotels":
                     month = params.get("month", None) or extract_month_or_dates(user_message)
+                    clarification = need_clarification_for_hotels(destination, month)
+                    if clarification:
+                        return AgentResponse(
+                            answer=clarification,
+                            decision={
+                                "intent": intent,
+                                "destination": destination,
+                                "kb_used": bool(kb_info),
+                                "tools_called": tools_called,
+                                "llm_decision": {
+                                    "use_tools": False,
+                                    "tools": [],
+                                    "reason": f"Missing parameters for hotels: {clarification}"
+                                }
+                            }
+                        )
+
                     resp = requests.post(
                         "http://127.0.0.1:8000/mcp/hotels",
-                        json={"city": city_for_tool, "month": month},
-                        timeout=30
+                        json={"city": destination, "month": month},
+                        timeout=45
                     )
                     resp.raise_for_status()
                     tool_results["hotels"] = resp.json()
                     tools_called.append("hotel_scraper")
 
                 elif name == "flights":
-                    # ---- IATA mapping ----
-                    origin_city_fallback = origin_city  # ex: "paris" si phrase "de paris à bangkok"
-                    dest_city_fallback = dest_city or destination  # ex: "bangkok"
+                    origin_city_fallback = origin_city
+                    dest_city_fallback = dest_city or destination
 
                     origin_iata = get_airport_code(origin_city_fallback) if origin_city_fallback else None
                     dest_iata = get_airport_code(dest_city_fallback) if dest_city_fallback else None
 
                     month = params.get("month", None) or extract_month_or_dates(user_message)
-
                     clarification = need_clarification_for_flights(origin_iata, dest_iata, month)
                     if clarification:
                         return AgentResponse(
@@ -244,7 +298,6 @@ def query_agent(payload: AgentQuery):
 
     # =========================================================
     # 4) Réponse finale via LLM
-    # (IMPORTANT: le prompt doit éviter d'inventer des prix si flights absent)
     # =========================================================
     final_answer = generate_answer(
         user_message=user_message,
@@ -254,7 +307,7 @@ def query_agent(payload: AgentQuery):
     )
 
     # =========================================================
-    # 5) Retour (traçable pour la soutenance)
+    # 5) Retour
     # =========================================================
     return AgentResponse(
         answer=final_answer,

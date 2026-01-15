@@ -62,7 +62,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     return json.loads(m.group(0))
 
 
-# --- Ancienne classification (optionnelle) ---
+#classification des intentions de l'utilisateur
 def classify_intent(message: str) -> str:
     system = (
         "Tu es un classificateur d'intention utilisateur.\n"
@@ -74,7 +74,6 @@ def classify_intent(message: str) -> str:
     return "travel" if "travel" in out else "social"
 
 
-# --- Nouvelle classification recommandée (4 catégories) ---
 def classify_intent_llm_4cats(message: str) -> str:
     system = (
         "Tu es un classificateur d'intention.\n"

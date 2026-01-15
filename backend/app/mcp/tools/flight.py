@@ -1,27 +1,3 @@
-"""import requests
-from bs4 import BeautifulSoup
-
-def scrape_flights(origin: str, destination: str, month: str):
-    url = f"https://www.kayak.fr/flights/{origin}-{destination}/{month}"
-
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    price_tag = soup.find("span", class_="price-text")
-
-    price = price_tag.text if price_tag else "Prix non trouvé"
-
-    return {
-        "origin": origin,
-        "destination": destination,
-        "month": month,
-        "cheapest_price": price,
-        "source": "Kayak"
-    }"""
-
-# backend/app/mcp/tools/flight.py
 import re
 import requests
 from datetime import date
@@ -38,13 +14,13 @@ def _month_to_dates(month: str):
 
     month = month.strip()
 
-    # cas "2026-01-30/2026-02-20"
+    # cas "2026-01-30/2026-02-20" pour les dates précises
     if "/" in month:
         parts = month.split("/")
         if len(parts) == 2 and len(parts[0]) == 10 and len(parts[1]) == 10:
             return parts[0], parts[1]
 
-    # cas "2026-01"
+    # cas "2026-01" pour les dates simples
     if re.fullmatch(r"\d{4}-\d{2}", month):
         y, m = month.split("-")
         y = int(y); m = int(m)
@@ -60,7 +36,6 @@ def _pick_price_from_text(text: str) -> str | None:
     """
     Fallback simple: cherche un prix en € dans le HTML.
     """
-    # Ex: "1 234 €" ou "123 €"
     m = re.search(r"(\d[\d\s]{1,10})\s?€", text)
     if not m:
         return None
@@ -91,9 +66,7 @@ def scrape_flights(origin: str, destination: str, month: str):
             "source": "Kayak"
         }
 
-    # URL Kayak formatée comme l'exemple
     url = f"https://www.kayak.fr/flights/{origin}-{destination}/{depart_date}/{return_date}"
-    # On garde un query string minimal (sinon Kayak peut rediriger / changer)
     params = {"sort": "bestflight_a"}
 
     headers = {
