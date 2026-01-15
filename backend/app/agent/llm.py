@@ -8,6 +8,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "220"))  # ~6-10 lignes
 
 
 def _ollama_chat(system_prompt: str, user_prompt: str) -> str:
@@ -28,7 +29,10 @@ def _ollama_chat(system_prompt: str, user_prompt: str) -> str:
             {"role": "system", "content": strict_system},
             {"role": "user", "content": user_prompt},
         ],
-        "options": {"temperature": OLLAMA_TEMPERATURE},
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "num_predict": OLLAMA_MAX_TOKENS,
+        },
     }
 
     try:
@@ -44,7 +48,6 @@ def _ollama_chat(system_prompt: str, user_prompt: str) -> str:
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
-    # Enlève ```json ... ```
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
 
@@ -73,14 +76,6 @@ def classify_intent(message: str) -> str:
 
 # --- Nouvelle classification recommandée (4 catégories) ---
 def classify_intent_llm_4cats(message: str) -> str:
-    """
-    Classifie le message dans UNE SEULE catégorie parmi:
-    - small_talk : salutations, remerciements, small talk, discussion légère
-    - intent_metier : questions liées à la planification de voyage/transport
-    - hors_perimetre : questions sans rapport (math, dev, politique, etc.)
-    - ambigu : pas assez d'info / message trop vague
-    Retourne uniquement l'un de ces 4 mots.
-    """
     system = (
         "Tu es un classificateur d'intention.\n"
         "Tu dois répondre STRICTEMENT par UNE SEULE catégorie parmi:\n"
@@ -99,12 +94,11 @@ def classify_intent_llm_4cats(message: str) -> str:
     )
 
     out = _ollama_chat(system, f"Message: {message}").strip().lower()
-
     allowed = {"small_talk", "intent_metier", "hors_perimetre", "ambigu"}
+
     if out in allowed:
         return out
 
-    # fallback robuste si le modèle renvoie une phrase
     for cat in allowed:
         if cat in out:
             return cat
@@ -125,71 +119,43 @@ def decide_tools(
     - weather: POST /mcp/weather  payload: {"city": "<CityName>"}
     - flights: POST /mcp/flights payload: {"from": "<origin>", "to": "<destination>", "month": "<month>"}
     - hotels: POST /mcp/hotels   payload: {"city": "<CityName>", "month": "<month>"}
-
-    JSON attendu:
-    {
-      "use_tools": true/false,
-      "tools": [
-        {"name": "weather|flights|hotels", "params": {...}}
-      ],
-      "reason": "..."
-    }
     """
     if available_tools is None:
         available_tools = ["weather", "flights", "hotels"]
 
     system = (
         "Tu es le module de décision d'un agent de voyage.\n"
-        "Ta mission: décider si des données temps réel sont nécessaires.\n"
-        "Tu dois répondre STRICTEMENT en JSON valide (pas de texte autour).\n\n"
-        "RÈGLES:\n"
-        "- Si la KB suffit: use_tools=false.\n"
-        "- Si l'utilisateur demande météo actuelle => tool weather.\n"
-        "- Si l'utilisateur demande prix / horaires / disponibilité vols => tool flights.\n"
-        "- Si l'utilisateur demande hôtels / prix / disponibilité hébergements => tool hotels.\n"
+        "Tu dois répondre STRICTEMENT en JSON valide (aucun texte autour).\n\n"
+        "RÈGLES IMPÉRATIVES:\n"
+        "- Si le message parle de vols / billets / avion / prix => use_tools=true et tool='flights'.\n"
+        "- Si le message parle de météo actuelle => use_tools=true et tool='weather'.\n"
+        "- Si le message parle d'hôtels/logement/prix hôtel => use_tools=true et tool='hotels'.\n"
+        "- Si la question porte uniquement sur période/climat/conseils et que la KB contient la réponse => use_tools=false.\n"
         "- Si destination inconnue => use_tools=false.\n"
-        "- N'invente pas de ville.\n"
-        "- Si l'utilisateur ne donne pas de mois, mets month=null.\n"
-        "- Pour flights, si l'utilisateur ne donne pas d'origine, mets from=null.\n\n"
+        "- Si mois/dates manquent, mets month=null.\n"
+        "- Pour flights, si origine manque, mets from=null.\n\n"
         f"TOOLS POSSIBLES: {available_tools}\n\n"
         "FORMAT JSON EXACT:\n"
-        "{\n"
-        '  "use_tools": true|false,\n'
-        '  "tools": [\n'
-        '    {"name": "weather|flights|hotels", "params": { ... }}\n'
-        "  ],\n"
-        '  "reason": "string courte"\n'
-        "}\n"
+        '{ "use_tools": true|false, "tools": [{"name": "weather|flights|hotels", "params": {...}}], "reason": "..." }'
     )
 
+    # Contexte allégé (plus rapide)
     context = {
         "user_message": user_message,
-        "destination": destination,  # ex: "lisbonne"
-        "kb_info_available": bool(kb_info),
-        "kb_info": kb_info,
+        "destination": destination,
+        "kb_available": bool(kb_info),
         "available_tools": available_tools,
-        "expected_params_by_tool": {
-            "weather": {"city": "string"},
-            "flights": {"from": "string|null", "to": "string", "month": "string|null"},
-            "hotels": {"city": "string", "month": "string|null"},
-        },
-        "note": (
-            "La destination est en minuscule (ex: lisbonne). "
-            "Le backend normalise pour le tool (ex: Lisbon). "
-            "Ne change pas la destination, réutilise-la."
-        ),
     }
 
     user_prompt = (
         "Contexte (JSON):\n"
-        f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
+        f"{json.dumps(context, ensure_ascii=False)}\n\n"
         "Décide maintenant et retourne uniquement le JSON."
     )
 
     raw = _ollama_chat(system, user_prompt)
     decision = _extract_json_object(raw)
 
-    # Validation + fallback safe
     use_tools = bool(decision.get("use_tools", False))
     tools = decision.get("tools", [])
     reason = decision.get("reason", "No reason provided")
@@ -197,38 +163,39 @@ def decide_tools(
     if not isinstance(tools, list):
         tools = []
 
-    # Si destination absente, on force no-tool (sécurité)
     if not destination:
         return {"use_tools": False, "tools": [], "reason": "No destination detected"}
 
-    # Filtre outils inconnus
     allowed = {t.lower() for t in available_tools}
     cleaned_tools = []
+
     for t in tools:
         name = (t.get("name") or "").lower().strip()
         params = t.get("params") or {}
+
         if name not in allowed:
             continue
 
-        # Nettoyage params selon tool
         if name == "weather":
             cleaned_tools.append({"name": "weather", "params": {"city": destination}})
         elif name == "hotels":
-            month = params.get("month", None)
-            cleaned_tools.append({"name": "hotels", "params": {"city": destination, "month": month}})
+            cleaned_tools.append({"name": "hotels", "params": {"city": destination, "month": params.get("month", None)}})
         elif name == "flights":
-            origin = params.get("from", None)
-            month = params.get("month", None)
-            cleaned_tools.append({"name": "flights", "params": {"from": origin, "to": destination, "month": month}})
+            cleaned_tools.append({"name": "flights", "params": {"from": params.get("from", None), "to": destination, "month": params.get("month", None)}})
 
     if not use_tools:
         cleaned_tools = []
 
-    return {
-        "use_tools": use_tools,
-        "tools": cleaned_tools,
-        "reason": reason
-    }
+    return {"use_tools": use_tools, "tools": cleaned_tools, "reason": reason}
+
+
+def _safe_get(d: Optional[Dict[str, Any]], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
 
 def generate_answer(
@@ -237,26 +204,42 @@ def generate_answer(
     kb_info: Optional[Dict[str, Any]],
     tool_results: Optional[Dict[str, Any]],
 ) -> str:
+    """
+    Génère la réponse finale.
+    - Anti-hallucination prix: si aucun tool_results.flights => ne donne aucun prix.
+    - Ajoute Source (url) si disponible.
+    - Formulation: 'de ORIGINE à DESTINATION' (pas 'à Paris à Bangkok').
+    """
+    flights = _safe_get(tool_results, "flights", default=None) if tool_results else None
+    weather = _safe_get(tool_results, "weather", default=None) if tool_results else None
+    hotels = _safe_get(tool_results, "hotels", default=None) if tool_results else None
+
     system = (
-        "Tu es un agent de planification de voyage.\n"
-        "Objectif: réponse utile, claire, actionnable.\n"
-        "Contraintes:\n"
-        "1) Utilise les infos de la KB si disponibles.\n"
-        "2) Utilise les résultats live si fournis.\n"
-        "3) Si info manquante, dis-le et propose la prochaine étape.\n"
-        "4) Réponse concise: 6 à 10 lignes max.\n"
-        "5) Ne mentionne jamais 'KB', 'MCP', 'tool', 'outil', 'scraping'.\n"
+        "Tu es un assistant de planification de voyage.\n"
+        "Réponds de manière utile, claire et actionnable.\n"
+        "6 à 10 lignes maximum.\n"
+        "Ne mentionne jamais 'KB', 'MCP', 'tool', 'outil', 'scraping'.\n\n"
+        "RÈGLES ANTI-HALLUCINATION:\n"
+        "- Si aucune donnée de vol n'est fournie (tool_results.flights absent), ne donne AUCUN prix.\n"
+        "- Si des données de vol sont fournies, utilise uniquement ces données pour le prix et les dates.\n"
+        "- Si une URL source est fournie, ajoute une ligne 'Source: <url>' à la fin.\n"
+        "- Quand tu exprimes un itinéraire, écris 'de ORIGINE à DESTINATION'.\n"
     )
 
+    # Contexte compact
     context = {
         "user_message": user_message,
         "destination": destination,
         "kb_info": kb_info,
-        "tool_results": tool_results,
+        "tool_results": {
+            "flights": flights,
+            "weather": weather,
+            "hotels": hotels,
+        }
     }
 
     user_prompt = (
-        "Voici le contexte (JSON) à utiliser pour répondre:\n"
+        "Voici le contexte JSON à utiliser:\n"
         f"{json.dumps(context, ensure_ascii=False, indent=2)}\n\n"
         "Rédige la meilleure réponse possible pour l'utilisateur."
     )
